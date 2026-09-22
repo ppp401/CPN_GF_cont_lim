@@ -1,0 +1,13 @@
+# legacy files
+legacy/
+
+# OS generated files
+.DS_Store
+.vscode/
+__pycache__/
+cpn_gf/__pycache__/
+tests/__pycache__/
+
+# specific runs and config files
+runs/*
+experiment.toml

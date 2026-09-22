@@ -1,0 +1,117 @@
+# CPN HMC + 在线 Gradient Flow 示例配置。
+# 标记“沿用”的概念在旧三脚本中已经存在；“新增”是统一管线新增的控制项。
+# 所有步数都是“每条独立 Markov 链”的 HMC trajectory 数，样本总数则是所有链合计。
+
+[model]
+# [沿用] CP(N-1) 中的 N；z 在每个格点有 N 个复分量。N 越大越耗时、耗显存。
+N = 2
+# [沿用] 四个裸耦合。若 normalize=true，会先同时除以 beta+beta1，再乘下面的 mul。
+beta = 1.0
+beta1 = 0.0
+alpha = 0.0
+alpha1 = 0.0
+# [沿用] beta1 改进项形式；beta1=0 时自动使用 mod=0，此值会被忽略。
+mod = 0
+# [沿用] 依次运行的缩放系数；每个 mul 建立独立 run/checkpoint/result。
+mul = [0.8, 0.9]
+# [沿用] 是否令 beta+beta1=1。目录和 manifest 同时记录归一化前后参数。
+normalize = true
+
+[lattice]
+# [新增] 正数表示直接固定生产格点 L×L；0 表示先做 pilot 自动估计 L。
+L = 0
+# [沿用] pilot 使用的试探格点。应足够大，使 pilot xi < L0/2。
+L0 = 50
+# [沿用] 自动格点取 L=L_multiple*ceil(xi_pilot)，再受 minimum_L 下限约束。
+L_multiple = 6
+minimum_L = 6
+# [沿用] pilot 中每条链的 HMC 热化 trajectory 数；此阶段也会自动调 step size。
+pilot_warmup = 400
+# [改为总量] pilot 的所有链合计样本数。程序会向上取整以保证每条链一样长。
+pilot_total_samples = 10000
+
+[hmc]
+# [调整默认值] 同时驻留 GPU 的独立 HMC 链数。RTX 3060、L<=100 推荐 64。
+# 增加它会提高小格点 GPU 利用率，但不会增加下面定义的“总样本预算”。
+# 可先用 `python -m cpn_gf recommend-chains --config <配置> --pilot` 在目标机器实测。
+# 已有 mul 会始终沿用其冻结值；实验根配置的新值只用于尚未创建的 mul。
+chains = 64
+# [沿用] 正式格点开始 scale-setting 前，每条链的热化/自动调参 trajectory 数。
+warmup = 2000
+# [新增自动调参] dual averaging 的目标 HMC 接受率；生产期会冻结调好的 step size。
+target_accept = 0.8
+# [沿用] 自动调参的初始 leapfrog 步长，不是最终生产步长。
+initial_step_size = 0.01
+# [替代固定 n_leapfrog] MD 轨迹总长度；实际步数约为 trajectory_length/step_size。
+trajectory_length = 0.4
+# [新增] 每条轨迹长度的相对随机扰动；0.1 表示在 ±10% 内变化，减少共振。
+trajectory_jitter = 0.1
+# [沿用] a 与 z 的虚拟动量质量，只影响 HMC 动力学效率，不改变目标分布。
+mass_a = 1.0
+mass_z = 1.0
+# [沿用] 仅 alpha!=0 时使用的整数 plaquette 场 s 的 Metropolis 参数。
+# alpha=0 时 s 不会创建、更新或保存，以下三项全部被忽略。
+s_step = 1.0
+s_updates = 3
+s_max = 100
+
+[sampling]
+# [改为总量] scale-setting 的所有链合计样本数，仅测 S00/S10/S01，
+# 用于 xi、jackknife xi 和 tau；拓扑及最终物理量统一在 production 测量。
+scale_total_samples = 50000
+# [沿用] 相邻 scale-setting 样本间推进多少条 HMC trajectory。
+scale_stride = 4
+# [改为总量] 在线 flow 至少/至多处理多少个构型（所有链合计）。
+# 64 链时默认值分别约为每链 157 和 1563；实际值会向上取整到链数的整数倍。
+flow_min_total_samples = 10000
+flow_max_total_samples = 100000
+# [改为总量] 每新增约多少个 flow 构型检查一次误差；同样向上取整到链数整数倍。
+convergence_batch_total_samples = 6400
+# [新增] 全部 rho 上 t*E_action 必须低于的 jackknife 相对误差。
+relative_error = 0.02
+# [新增] 连续多少次误差检查合格才停止，避免一次偶然偏小的误差导致早停。
+consecutive_checks = 2
+# [沿用/自动化] flow 构型至少相隔的 HMC trajectory 数；程序还会用 scale tau 增大它。
+minimum_flow_stride = 20
+# [沿用] integrated autocorrelation time 的自动窗口系数。
+tau_window_c = 5.0
+
+[flow]
+# [沿用] 要报告的无量纲流时 rho=t/xi^2，必须为正且严格递增。
+rho = [0.01, 0.05, 0.09, 0.13, 0.17, 0.21, 0.25]
+# [沿用] flow 积分步长。更小更准确但步数和耗时近似反比增加。
+epsilon = 0.01
+# [沿用] flow 方程中 a、z 的质量参数，与 HMC 的质量相互独立。
+mass_a = 1.0
+mass_z = 1.0
+# [沿用] false 使用模型 action flow；true 使用 covariant flow。
+covariant = false
+# [新增] 同一次送入 flow 的显存内构型数；0 为自动。
+# 当前 RTX 3060 的自动值约为 L<=64:384，65<=L<=128:128，L>128:64，
+# 并会取 chains 的整数倍、受 max_vram_fraction 限制、OOM 时自动减半。
+buffer_configurations = 0
+# 每个 production 待-flow构型会同时保存未-flow的 chi_m/xi/Q_z/Q_U，
+# alpha!=0 时再保存 Q_s；flow 后保存 tE、chi_m/xi 以及 Q_z/Q_U 的 chi_t。
+
+[analysis]
+# 连续极限拟合允许使用的最小 t/a^2。更小流时的数据仍会画在图中（空心灰点），但不参与拟合。
+# 这是纯后处理参数，不改变 HMC、flow、已存样本或 checkpoint；旧程序中的默认截断相当于 1.0。
+min_t_over_a2_for_fit = 1.0
+
+[compute]
+# [新增统一后端] "cuda:0" 使用第一张 NVIDIA GPU；"cpu" 使用同一套 Torch 算法。
+device = "cuda:0"
+# 正式计算固定为双精度；当前不接受 float32，避免大体积 HMC 能量误差破坏接受率。
+dtype = "float64"
+# [沿用] 整个实验的主随机种子；不同 mul/阶段会从它派生不同 RNG 流。
+seed = 12345
+# [新增] 要求 Torch 使用确定性算法，使同设备 checkpoint 恢复可精确复现。
+deterministic = true
+# [新增] 自动 batch 最多使用的显存比例；0.70 为桌面显示和驱动预留约 30%。
+max_vram_fraction = 0.70
+
+[output]
+# [新增] 新 schema 的实验根目录；不会读写或删除旧 gf_data/gf_results/gf_plots。
+root = "runs"
+# [新增] 完成后是否保留最后一个当前状态 checkpoint；它不包含历史构型。
+keep_final_checkpoint = true

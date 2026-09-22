@@ -1,0 +1,289 @@
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+
+from cpn_gf.analysis import analyze_path
+from cpn_gf.config import fingerprint, load_config, run_family_fingerprint
+from cpn_gf.runner import (_flow_buffer_configurations, _restore, _run_seed,
+                           pilot_config, resume_run, run_config)
+
+
+class RunnerSmokeTests(unittest.TestCase):
+    @staticmethod
+    def _write_config(path, mul, output, warmup=2000, chains=64):
+        path.write_text(f'''\
+[model]
+mul = {mul}
+[hmc]
+warmup = {warmup}
+chains = {chains}
+[compute]
+device = "cpu"
+seed = 7
+[output]
+root = "{output.as_posix()}"
+''', encoding="utf-8")
+
+    def test_tiny_cpu_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "tiny.toml"
+            output = (root / "runs").as_posix()
+            config.write_text(f'''\
+[model]
+mul = [2.0]
+[lattice]
+L = 4
+[hmc]
+chains = 6
+warmup = 50
+initial_step_size = 0.005
+trajectory_length = 0.01
+trajectory_jitter = 0.0
+[sampling]
+scale_total_samples = 1200
+scale_stride = 1
+flow_min_total_samples = 12
+flow_max_total_samples = 12
+convergence_batch_total_samples = 12
+relative_error = 0.99
+consecutive_checks = 1
+minimum_flow_stride = 1
+[flow]
+rho = [0.01]
+epsilon = 0.05
+buffer_configurations = 12
+[compute]
+device = "cpu"
+seed = 7
+[output]
+root = "{output}"
+''', encoding="utf-8")
+            experiment, manifests = run_config(config)
+            run_dir = next(experiment.glob("mul_*"))
+            self.assertTrue((run_dir / "results.npz").is_file())
+            self.assertTrue((run_dir / "checkpoint.pt").is_file())
+            self.assertFalse(any((run_dir / "observations").glob("*config*")))
+            with np.load(run_dir / "results.npz", allow_pickle=False) as data:
+                self.assertEqual(data["n_samples_per_chain"].tolist(), [2] * 6)
+                self.assertIn("unflowed_chi_m", data.files)
+                self.assertIn("unflowed_chi_t_Q_z", data.files)
+                self.assertIn("unflowed_chi_t_Q_U", data.files)
+                self.assertFalse(bool(data["unflowed_Q_s_applicable"]))
+            self.assertIn(manifests[0]["status"], ("ok", "complete_with_warning"))
+            self.assertIsNone(manifests[0]["acceptance_rate_s"])
+            self.assertEqual(manifests[0]["completed_total_samples"], 12)
+            self.assertEqual(manifests[0]["committed_chunks"], 1)
+            self.assertEqual(manifests[0]["run_seed"], _run_seed(load_config(config), 2.0))
+            resumed = resume_run(experiment)
+            self.assertEqual(resumed["status"], "complete")
+            self.assertEqual(resumed["runs"][0]["action"], "skipped")
+
+    def test_automatic_flow_buffer_targets(self):
+        cfg = {"flow": {"buffer_configurations": 0},
+               "compute": {"device": "cpu", "max_vram_fraction": 0.70}}
+        self.assertEqual(_flow_buffer_configurations(cfg, 48, 64), 384)
+        self.assertEqual(_flow_buffer_configurations(cfg, 96, 64), 128)
+        self.assertEqual(_flow_buffer_configurations(cfg, 160, 64), 64)
+
+    def test_experiment_resume_prioritizes_checkpoint_then_starts_added_mul(self):
+        with tempfile.TemporaryDirectory() as directory:
+            experiment = Path(directory) / "experiment"
+            experiment.mkdir()
+            root_config = experiment / "config.toml"
+            old_config = Path(directory) / "old.toml"
+            self._write_config(root_config, "[0.7, 0.8, 0.9]", Path(directory) / "runs")
+            self._write_config(old_config, "[0.8, 0.9]", Path(directory) / "runs")
+            for mul, phase in ((0.8, "production"), (0.9, "complete")):
+                run_dir = experiment / f"mul_{mul:g}"
+                run_dir.mkdir()
+                shutil.copy2(old_config, run_dir / "config.toml")
+                (run_dir / "manifest.json").write_text(json.dumps({
+                    "phase": phase, "status": "ok" if phase == "complete" else "running",
+                    "model": {"mul": mul}}), encoding="utf-8")
+
+            events = []
+
+            def restore(cfg, run_dir):
+                events.append(("restore", run_dir.name))
+                mul = float(run_dir.name.removeprefix("mul_"))
+                return object(), {"model": {"mul": mul}}, 0, 0, 0
+
+            def prepare(cfg, model, run_dir, seed):
+                events.append(("prepare", run_dir.name))
+                return object(), {"model": model}, 0, 0, 0
+
+            def production(cfg, run_dir, engine, manifest, samples, chunks, streak):
+                events.append(("production", run_dir.name))
+                return {"status": "ok"}
+
+            with patch("cpn_gf.runner._restore", side_effect=restore), \
+                    patch("cpn_gf.runner._prepare_new", side_effect=prepare), \
+                    patch("cpn_gf.runner._production", side_effect=production):
+                result = resume_run(experiment)
+
+            self.assertEqual(events, [
+                ("restore", "mul_0.8"), ("production", "mul_0.8"),
+                ("prepare", "mul_0.7"), ("production", "mul_0.7")])
+            self.assertEqual([(x["mul"], x["action"]) for x in result["runs"]],
+                             [(0.8, "resumed"), (0.7, "started"), (0.9, "skipped")])
+            self.assertTrue((experiment / "mul_0.7" / "config.toml").is_file())
+
+    def test_run_seed_does_not_depend_on_mul_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "first.toml", root / "second.toml"
+            self._write_config(first, "[0.7, 0.8]", root / "runs")
+            self._write_config(second, "[0.8, 0.7]", root / "runs")
+            self.assertEqual(_run_seed(load_config(first), 0.7),
+                             _run_seed(load_config(second), 0.7))
+            self.assertNotEqual(_run_seed(load_config(first), 0.7),
+                                _run_seed(load_config(first), 0.8))
+
+    def test_experiment_may_resume_old_chains_then_start_new_chains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            experiment.mkdir()
+            root_config = experiment / "config.toml"
+            old_config = root / "old.toml"
+            self._write_config(root_config, "[0.8, 0.9]", root / "runs", chains=128)
+            self._write_config(old_config, "[0.8]", root / "runs")
+            run_dir = experiment / "mul_0.8"
+            run_dir.mkdir()
+            shutil.copy2(old_config, run_dir / "config.toml")
+            (run_dir / "manifest.json").write_text(json.dumps({
+                "phase": "production", "status": "running",
+                "model": {"mul": 0.8}}), encoding="utf-8")
+            seen = []
+
+            def restore(cfg, path):
+                seen.append(("restore", cfg["hmc"]["chains"]))
+                return object(), {"model": {"mul": 0.8}}, 0, 0, 0
+
+            def prepare(cfg, model, path, seed):
+                seen.append(("prepare", cfg["hmc"]["chains"]))
+                return object(), {"model": model}, 0, 0, 0
+
+            with patch("cpn_gf.runner._restore", side_effect=restore), \
+                    patch("cpn_gf.runner._prepare_new", side_effect=prepare), \
+                    patch("cpn_gf.runner._production", return_value={"status": "ok"}):
+                resume_run(experiment)
+            self.assertEqual(seen, [("restore", 64), ("prepare", 128)])
+            self.assertEqual(load_config(experiment / "mul_0.9" / "config.toml")
+                             ["hmc"]["chains"], 128)
+
+    def test_run_family_allows_only_chain_count_difference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "first.toml", root / "second.toml"
+            self._write_config(first, "[0.8]", root / "runs")
+            self._write_config(second, "[0.8]", root / "runs", chains=128)
+            self.assertEqual(run_family_fingerprint(load_config(first)),
+                             run_family_fingerprint(load_config(second)))
+
+    def test_mul_directory_collisions_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "collision.toml"
+            self._write_config(path, "[1.0000001, 1.0000002]", Path(directory) / "runs")
+            with self.assertRaisesRegex(ValueError, "distinct mul_\\* directory names"):
+                load_config(path)
+
+    def test_experiment_resume_rejects_non_mul_config_changes_before_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            experiment = Path(directory) / "experiment"
+            experiment.mkdir()
+            root_config = experiment / "config.toml"
+            child_source = Path(directory) / "child.toml"
+            output = Path(directory) / "runs"
+            self._write_config(root_config, "[0.8]", output, warmup=3000)
+            self._write_config(child_source, "[0.8]", output, warmup=2000)
+            run_dir = experiment / "mul_0.8"
+            run_dir.mkdir()
+            shutil.copy2(child_source, run_dir / "config.toml")
+            (run_dir / "manifest.json").write_text(json.dumps({
+                "phase": "production", "status": "running", "model": {"mul": 0.8}}),
+                encoding="utf-8")
+            with patch("cpn_gf.runner._restore") as restore:
+                with self.assertRaisesRegex(ValueError, "settings other than"):
+                    resume_run(experiment)
+                restore.assert_not_called()
+
+    def test_pilot_only_writes_summaries_and_honors_fixed_production_lattice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "pilot.toml"
+            self._write_config(config, "[0.7, 0.8]", root / "runs")
+            with config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[lattice]\nL = 12\nL0 = 20\n")
+
+            def pilot_result(cfg, model, seed):
+                xi = float(model["mul"]) * 2
+                return {"xi": xi, "xi_error": 0.1, "tau_max": 1.5, "L0": 20,
+                        "L": 30, "recommended_L": 30, "step_size": 0.02,
+                        "samples_per_chain": 2, "total_samples": 128}
+
+            with patch("cpn_gf.runner._run_pilot", side_effect=pilot_result):
+                result = pilot_config(config)
+
+            experiment = Path(result["experiment"])
+            self.assertTrue((experiment / "pilot_results.json").is_file())
+            self.assertTrue((experiment / "pilot_results.csv").is_file())
+            self.assertEqual([item["action"] for item in result["runs"]],
+                             ["piloted", "piloted"])
+            for mul in (0.7, 0.8):
+                run_dir = experiment / f"mul_{mul:g}"
+                manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["phase"], "pilot_complete")
+                self.assertEqual(manifest["L"], 12)
+                self.assertEqual(manifest["pilot"]["recommended_L"], 30)
+                self.assertFalse((run_dir / "checkpoint.pt").exists())
+                self.assertFalse((run_dir / "scale.npz").exists())
+            with self.assertRaisesRegex(RuntimeError, "no production runs"):
+                analyze_path(experiment)
+
+    def test_restore_from_pilot_uses_saved_result_without_rerunning_pilot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.toml"
+            self._write_config(config, "[0.8]", root / "runs")
+            cfg = load_config(config)
+            run_dir = root / "mul_0.8"
+            run_dir.mkdir()
+            shutil.copy2(config, run_dir / "config.toml")
+            manifest = {"schema_version": 1, "config_fingerprint": fingerprint(cfg),
+                "phase": "pilot_complete", "status": "pilot_complete",
+                "model": {"mul": 0.8}, "analysis": cfg["analysis"],
+                "run_seed": _run_seed(cfg, 0.8)}
+            (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            expected = (object(), manifest, 0, 0, 0)
+            with patch("cpn_gf.runner._start_after_pilot", return_value=expected) as start, \
+                    patch("cpn_gf.runner._run_pilot") as pilot:
+                self.assertIs(_restore(cfg, run_dir), expected)
+                start.assert_called_once()
+                pilot.assert_not_called()
+
+    def test_failed_pilot_is_persisted_and_stops_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "pilot.toml"
+            self._write_config(config, "[0.7, 0.8]", root / "runs")
+            with patch("cpn_gf.runner._run_pilot", side_effect=RuntimeError("bad xi")):
+                with self.assertRaisesRegex(RuntimeError, "pilot failed in"):
+                    pilot_config(config)
+            experiment = next((root / "runs").iterdir())
+            manifest = json.loads((experiment / "mul_0.7" / "manifest.json")
+                                  .read_text(encoding="utf-8"))
+            self.assertEqual(manifest["phase"], "pilot_error")
+            self.assertIn("bad xi", manifest["error"])
+            self.assertTrue((experiment / "pilot_results.json").is_file())
+            self.assertFalse((experiment / "mul_0.8").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
