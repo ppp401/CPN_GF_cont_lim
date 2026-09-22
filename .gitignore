@@ -10,4 +10,5 @@ tests/__pycache__/
 
 # specific runs and config files
 runs/*
+!runs/.gitkeep
 experiment.toml
