@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import shutil
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -174,9 +175,24 @@ def _restore(cfg, run_dir):
         raise ValueError(f"run schema {manifest['schema_version']} cannot be resumed by schema {SCHEMA}; "
                          "completed older runs remain analyzable")
     if manifest["config_fingerprint"] != fingerprint(cfg):
-        raise ValueError("configuration does not match this run")
-    # Runs created before the analysis table was introduced remain resumable.
-    manifest.setdefault("analysis", cfg["analysis"])
+        # Preserve the old on-disk fingerprint while permitting this purely
+        # scheduling-related convergence setting to change.
+        prior_batch = manifest.get("sampling", {}).get(
+            "convergence_batch_total_samples")
+        compatible_cfg = deepcopy(cfg)
+        if prior_batch is not None:
+            compatible_cfg["sampling"]["convergence_batch_total_samples"] = prior_batch
+        if prior_batch is None or manifest["config_fingerprint"] != fingerprint(compatible_cfg):
+            raise ValueError("configuration does not match this run")
+    # Analysis settings are checkpoint-safe, but changing the online error
+    # selection invalidates a convergence streak accumulated under the old rule.
+    previous_minimum = manifest.get("analysis", {}).get("min_t_over_a2_for_fit")
+    current_minimum = float(cfg["analysis"]["min_t_over_a2_for_fit"])
+    threshold_changed = (previous_minimum is None
+                         or float(previous_minimum) != current_minimum)
+    manifest["analysis"] = cfg["analysis"]
+    manifest["sampling"] = cfg["sampling"]
+    manifest["config_fingerprint"] = fingerprint(cfg)
     manifest.pop("error", None)
     manifest["status"] = "running"
     if manifest.get("phase") == "pilot_complete":
@@ -199,8 +215,9 @@ def _restore(cfg, run_dir):
         raise RuntimeError("this run is already complete")
     if checkpoint["phase"] != "production":
         raise RuntimeError(f"unsupported checkpoint phase: {checkpoint['phase']}")
-    return (engine, manifest, int(checkpoint["samples"]), int(checkpoint["chunks"]),
-            int(checkpoint.get("convergence_streak", 0)))
+    streak = 0 if threshold_changed else int(checkpoint.get("convergence_streak", 0))
+    atomic_json(run_dir / "manifest.json", manifest)
+    return (engine, manifest, int(checkpoint["samples"]), int(checkpoint["chunks"]), streak)
 
 
 def _production(cfg, run_dir, engine, manifest, samples, chunks, streak):
@@ -264,7 +281,16 @@ def _production(cfg, run_dir, engine, manifest, samples, chunks, streak):
                         peak_memory_mib=max(float(manifest.get("peak_memory_mib", 0)), peak_mib))
         atomic_json(run_dir / "manifest.json", manifest)
         if samples >= minimum and samples // check_every > (samples - take) // check_every:
-            _, summary = analyze_run(run_dir, write=True)
+            _, summary = analyze_run(
+                run_dir, write=True,
+                minimum_flow_time=cfg["analysis"]["min_t_over_a2_for_fit"])
+            maximum_error = summary["maximum_tE_relative_error"]
+            maximum_time = summary["maximum_tE_relative_error_flow_time"]
+            if maximum_error is None:
+                progress.set_postfix_str("max rel err=N/A @ t/a^2=N/A")
+            else:
+                progress.set_postfix_str(
+                    f"max rel err={maximum_error:.3e} @ t/a^2={maximum_time:g}")
             streak = streak + 1 if summary["converged"] else 0
             _write_checkpoint(run_dir, engine, "production", samples=samples, chunks=chunks,
                               convergence_streak=streak)
@@ -272,7 +298,9 @@ def _production(cfg, run_dir, engine, manifest, samples, chunks, streak):
                 converged = True
                 break
     progress.close()
-    result, summary = analyze_run(run_dir, write=True)
+    result, summary = analyze_run(
+        run_dir, write=True,
+        minimum_flow_time=cfg["analysis"]["min_t_over_a2_for_fit"])
     converged = converged or (summary["converged"] and streak >= needed)
     s_acceptance = (None if engine.s is None else
                     (engine.accepted_metro.double()
@@ -282,6 +310,8 @@ def _production(cfg, run_dir, engine, manifest, samples, chunks, streak):
                     completed_total_samples=samples * chains,
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                     maximum_tE_relative_error=summary["maximum_tE_relative_error"],
+                    maximum_tE_relative_error_flow_time=(
+                        summary["maximum_tE_relative_error_flow_time"]),
                     acceptance_rate_hmc=(engine.accepted_hmc.double()
                                          / torch.clamp(engine.attempted_hmc, min=1)).cpu().numpy(),
                     acceptance_rate_s=s_acceptance)
@@ -394,7 +424,8 @@ def pilot_experiment(experiment_dir):
             if run_family_fingerprint(cfg) != run_family_fingerprint(root_cfg):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
-                    "model.mul, hmc.chains, or analysis")
+                    "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
+                    "or analysis")
         if manifest_path.is_file():
             with manifest_path.open(encoding="utf-8") as fh:
                 manifest = json.load(fh)
@@ -491,7 +522,11 @@ def resume_experiment(experiment_dir):
             if run_family_fingerprint(child_cfg) != run_family_fingerprint(root_cfg):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
-                    "model.mul, hmc.chains, or analysis")
+                    "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
+                    "or analysis")
+            child_cfg["analysis"] = dict(root_cfg["analysis"])
+            child_cfg["sampling"]["convergence_batch_total_samples"] = int(
+                root_cfg["sampling"]["convergence_batch_total_samples"])
             if manifest.get("phase") == "complete":
                 complete.append((mul, manifest))
             else:
@@ -519,7 +554,10 @@ def resume_experiment(experiment_dir):
             if run_family_fingerprint(cfg) != run_family_fingerprint(root_cfg):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
-                    "model.mul, hmc.chains, or analysis")
+                    "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
+                    "or analysis")
+            cfg["sampling"]["convergence_batch_total_samples"] = int(
+                root_cfg["sampling"]["convergence_batch_total_samples"])
             model = scaled_model(cfg, mul)
         else:
             shutil.copy2(experiment_dir / "config.toml", config_copy)

@@ -99,6 +99,8 @@ root = "{output}"
             old_config = Path(directory) / "old.toml"
             self._write_config(root_config, "[0.7, 0.8, 0.9]", Path(directory) / "runs")
             self._write_config(old_config, "[0.8, 0.9]", Path(directory) / "runs")
+            with root_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[analysis]\nmin_t_over_a2_for_fit = 2.0\n")
             for mul, phase in ((0.8, "production"), (0.9, "complete")):
                 run_dir = experiment / f"mul_{mul:g}"
                 run_dir.mkdir()
@@ -107,10 +109,11 @@ root = "{output}"
                     "phase": phase, "status": "ok" if phase == "complete" else "running",
                     "model": {"mul": mul}}), encoding="utf-8")
 
-            events = []
+            events, restored_thresholds = [], []
 
             def restore(cfg, run_dir):
                 events.append(("restore", run_dir.name))
+                restored_thresholds.append(cfg["analysis"]["min_t_over_a2_for_fit"])
                 mul = float(run_dir.name.removeprefix("mul_"))
                 return object(), {"model": {"mul": mul}}, 0, 0, 0
 
@@ -130,6 +133,7 @@ root = "{output}"
             self.assertEqual(events, [
                 ("restore", "mul_0.8"), ("production", "mul_0.8"),
                 ("prepare", "mul_0.7"), ("production", "mul_0.7")])
+            self.assertEqual(restored_thresholds, [2.0])
             self.assertEqual([(x["mul"], x["action"]) for x in result["runs"]],
                              [(0.8, "resumed"), (0.7, "started"), (0.9, "skipped")])
             self.assertTrue((experiment / "mul_0.7" / "config.toml").is_file())
@@ -186,6 +190,74 @@ root = "{output}"
             self._write_config(second, "[0.8]", root / "runs", chains=128)
             self.assertEqual(run_family_fingerprint(load_config(first)),
                              run_family_fingerprint(load_config(second)))
+
+    def test_experiment_resume_uses_new_convergence_batch_for_unfinished_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            experiment.mkdir()
+            root_config, child_config = experiment / "config.toml", root / "child.toml"
+            self._write_config(root_config, "[0.8, 0.9]", root / "runs")
+            self._write_config(child_config, "[0.8, 0.9]", root / "runs")
+            with root_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nconvergence_batch_total_samples = 12800\n")
+            with child_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nconvergence_batch_total_samples = 6400\n")
+            for mul, phase in ((0.8, "production"), (0.9, "complete")):
+                run_dir = experiment / f"mul_{mul:g}"
+                run_dir.mkdir()
+                shutil.copy2(child_config, run_dir / "config.toml")
+                (run_dir / "manifest.json").write_text(json.dumps({
+                    "phase": phase, "status": "running", "model": {"mul": mul}}),
+                    encoding="utf-8")
+
+            seen = []
+
+            def restore(cfg, run_dir):
+                seen.append((run_dir.name,
+                             cfg["sampling"]["convergence_batch_total_samples"]))
+                return object(), {"model": {"mul": 0.8}}, 0, 0, 0
+
+            with patch("cpn_gf.runner._restore", side_effect=restore), \
+                    patch("cpn_gf.runner._production", return_value={"status": "ok"}):
+                result = resume_run(experiment)
+
+            self.assertEqual(seen, [("mul_0.8", 12800)])
+            self.assertEqual([(item["mul"], item["action"]) for item in result["runs"]],
+                             [(0.8, "resumed"), (0.9, "skipped")])
+
+    def test_restore_allows_convergence_batch_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_config, new_config = root / "old.toml", root / "new.toml"
+            self._write_config(old_config, "[0.8]", root / "runs")
+            self._write_config(new_config, "[0.8]", root / "runs")
+            with old_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nconvergence_batch_total_samples = 6400\n")
+            with new_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nconvergence_batch_total_samples = 12800\n")
+            old_cfg, new_cfg = load_config(old_config), load_config(new_config)
+            run_dir = root / "mul_0.8"
+            run_dir.mkdir()
+            manifest = {"schema_version": 1, "config_fingerprint": fingerprint(old_cfg),
+                        "phase": "production", "status": "running",
+                        "model": {"mul": 0.8}, "L": 8, "chains": 4,
+                        "sampling": old_cfg["sampling"], "analysis": old_cfg["analysis"]}
+            (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            class Engine:
+                def load_state_dict(self, state):
+                    pass
+
+            checkpoint = {"phase": "production", "engine": {}, "samples": 10,
+                          "chunks": 2, "convergence_streak": 3}
+            with patch("cpn_gf.runner._new_engine", return_value=Engine()), \
+                    patch("cpn_gf.runner.load_checkpoint", return_value=checkpoint):
+                _, restored, _, _, streak = _restore(new_cfg, run_dir)
+
+            self.assertEqual(streak, 3)
+            self.assertEqual(restored["sampling"]["convergence_batch_total_samples"], 12800)
+            self.assertEqual(restored["config_fingerprint"], fingerprint(new_cfg))
 
     def test_mul_directory_collisions_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -267,6 +339,37 @@ root = "{output}"
                 self.assertIs(_restore(cfg, run_dir), expected)
                 start.assert_called_once()
                 pilot.assert_not_called()
+
+    def test_restore_resets_convergence_streak_when_flow_minimum_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.toml"
+            self._write_config(config, "[0.8]", root / "runs")
+            with config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[analysis]\nmin_t_over_a2_for_fit = 2.0\n")
+            cfg = load_config(config)
+            run_dir = root / "mul_0.8"
+            run_dir.mkdir()
+            manifest = {"schema_version": 1, "config_fingerprint": fingerprint(cfg),
+                        "phase": "production", "status": "running",
+                        "model": {"mul": 0.8}, "L": 8, "chains": 4,
+                        "analysis": {"min_t_over_a2_for_fit": 1.0}}
+            (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            class Engine:
+                def load_state_dict(self, state):
+                    self.state = state
+
+            checkpoint = {"phase": "production", "engine": {"state": 1},
+                          "samples": 10, "chunks": 2, "convergence_streak": 3}
+            with patch("cpn_gf.runner._new_engine", return_value=Engine()), \
+                    patch("cpn_gf.runner.load_checkpoint", return_value=checkpoint):
+                _, restored_manifest, samples, chunks, streak = _restore(cfg, run_dir)
+
+            self.assertEqual((samples, chunks, streak), (10, 2, 0))
+            self.assertEqual(restored_manifest["analysis"]["min_t_over_a2_for_fit"], 2.0)
+            saved = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["analysis"]["min_t_over_a2_for_fit"], 2.0)
 
     def test_failed_pilot_is_persisted_and_stops_scan(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -115,6 +115,9 @@ def run_family_fingerprint(cfg):
     # children keep their frozen value while newly added mul values may use a
     # new experiment-level value.
     clean["hmc"].pop("chains", None)
+    # This only controls how often accumulated production observations are
+    # checked for convergence. It does not alter the chain or saved data.
+    clean["sampling"].pop("convergence_batch_total_samples", None)
     payload = json.dumps(clean, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(payload.encode()).hexdigest()
 

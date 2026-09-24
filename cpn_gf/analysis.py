@@ -49,7 +49,28 @@ def load_chain_values(run_dir, chains):
     return [np.concatenate(x, axis=0) for x in per_chain], qs, times, output_steps, parts
 
 
-def analyze_run(run_dir, write=True):
+def _relative_error_summary(relative_errors, target_times, threshold, minimum_flow_time):
+    relative_errors = np.asarray(relative_errors, dtype=float)
+    target_times = np.asarray(target_times, dtype=float)
+    eligible = target_times >= float(minimum_flow_time)
+    if not np.any(eligible):
+        return {"maximum_tE_relative_error": None,
+                "maximum_tE_relative_error_flow_time": None,
+                "converged": True}
+    selected = relative_errors[eligible]
+    if not np.all(np.isfinite(selected)):
+        return {"maximum_tE_relative_error": None,
+                "maximum_tE_relative_error_flow_time": None,
+                "converged": False}
+    eligible_indices = np.flatnonzero(eligible)
+    local_index = int(np.argmax(selected))
+    index = int(eligible_indices[local_index])
+    return {"maximum_tE_relative_error": float(relative_errors[index]),
+            "maximum_tE_relative_error_flow_time": float(target_times[index]),
+            "converged": bool(np.all(selected <= float(threshold)))}
+
+
+def analyze_run(run_dir, write=True, minimum_flow_time=None):
     run_dir = Path(run_dir)
     with (run_dir / "manifest.json").open(encoding="utf-8") as fh:
         manifest = json.load(fh)
@@ -78,14 +99,18 @@ def analyze_run(run_dir, write=True):
         for key, value in qs.items():
             result[f"unflowed_Q_s_{key}"] = np.asarray(value)
     rel = np.abs(result["tE_action_error"] / result["tE_action"])
+    if minimum_flow_time is None:
+        minimum_flow_time = float(
+            manifest.get("analysis", {}).get("min_t_over_a2_for_fit", 1.0))
+    error_summary = _relative_error_summary(
+        rel, target_times, manifest["sampling"]["relative_error"], minimum_flow_time)
     xi_error = float(np.sqrt((len(xi_loo) - 1.0) / len(xi_loo)
                              * np.sum((xi_loo - xi_loo.mean()) ** 2)))
     summary = {"xi_scale": xi, "xi_scale_error": xi_error,
                "n_samples_per_chain": result["n_samples_per_chain"],
-               "maximum_tE_relative_error": float(np.nanmax(rel)),
                "all_tE_relative_errors": rel,
-               "converged": bool(np.all(np.isfinite(rel)) and
-                                  np.all(rel <= manifest["sampling"]["relative_error"]))}
+               "relative_error_min_t_over_a2": float(minimum_flow_time),
+               **error_summary}
     summary["unflowed"] = {
         name: {"mean": result[f"unflowed_{name}"],
                "error": result[f"unflowed_{name}_error"]}
@@ -142,7 +167,12 @@ def analyze_path(path):
             runs.append(run)
     if not runs:
         raise RuntimeError(f"no production runs found below {path}")
-    summaries = {run.name: analyze_run(run, write=True)[1] for run in runs}
+    minimum_flow_time = (float(load_config(path / "config.toml")["analysis"]
+                               ["min_t_over_a2_for_fit"])
+                         if (path / "config.toml").is_file() else None)
+    summaries = {run.name: analyze_run(run, write=True,
+                                      minimum_flow_time=minimum_flow_time)[1]
+                 for run in runs}
     _continuum_analysis(path, runs, summaries)
     atomic_json(path / "analysis.json", summaries)
     return summaries

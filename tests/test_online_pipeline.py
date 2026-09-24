@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from cpn_gf.analysis import analyze_run
+from cpn_gf.analysis import _relative_error_summary, analyze_run
 from cpn_gf.io import atomic_json, atomic_npz
 
 
@@ -14,7 +14,8 @@ class OnlineAnalysisTests(unittest.TestCase):
             root = Path(directory)
             rho = [0.05, 0.1]
             manifest = {"flow": {"rho": rho}, "L": 8, "chains": 3,
-                        "sampling": {"relative_error": 1.0}}
+                        "sampling": {"relative_error": 1.0},
+                        "analysis": {"min_t_over_a2_for_fit": 0.0}}
             atomic_json(root / "manifest.json", manifest)
             atomic_npz(root / "scale.npz", xi=np.asarray(2.0),
                        xi_loo=np.asarray([2.0, 2.0, 2.0]))
@@ -36,6 +37,27 @@ class OnlineAnalysisTests(unittest.TestCase):
             self.assertTrue(np.isfinite(summary["maximum_tE_relative_error"]))
             self.assertIn("unflowed_chi_t_Q_U", result)
             self.assertTrue(bool(result["unflowed_Q_s_applicable"]))
+
+    def test_relative_error_ignores_times_below_fit_minimum(self):
+        summary = _relative_error_summary(
+            [0.9, 0.03, 0.01], [0.5, 1.0, 2.0], threshold=0.02,
+            minimum_flow_time=1.0)
+        self.assertEqual(summary["maximum_tE_relative_error"], 0.03)
+        self.assertEqual(summary["maximum_tE_relative_error_flow_time"], 1.0)
+        self.assertFalse(summary["converged"])
+
+    def test_relative_error_with_no_eligible_times_is_vacuously_converged(self):
+        summary = _relative_error_summary(
+            [0.9, 0.8], [0.1, 0.2], threshold=0.02, minimum_flow_time=1.0)
+        self.assertIsNone(summary["maximum_tE_relative_error"])
+        self.assertIsNone(summary["maximum_tE_relative_error_flow_time"])
+        self.assertTrue(summary["converged"])
+
+    def test_nonfinite_eligible_error_does_not_converge(self):
+        summary = _relative_error_summary(
+            [0.01, np.nan], [1.0, 2.0], threshold=0.02, minimum_flow_time=1.0)
+        self.assertIsNone(summary["maximum_tE_relative_error"])
+        self.assertFalse(summary["converged"])
 
 
 if __name__ == "__main__":

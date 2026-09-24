@@ -68,8 +68,12 @@ python -m cpn_gf analyze --run runs/<experiment>
 ```
 
 `analysis.min_t_over_a2_for_fit` controls the minimum lattice flow time used
-by continuum fits. Smaller-flow-time points remain visible as excluded points
-in the plot. This analysis-only option does not invalidate a checkpoint.
+by continuum fits and by the online relative-error stopping test. The flow
+progress bar reports the largest included relative error and its `t/a^2` at
+each convergence check. Smaller-flow-time points are still stored and remain
+visible as excluded points in the plot. Changing this option does not
+invalidate a checkpoint; unfinished runs use the latest experiment-level
+value and restart their consecutive-convergence count.
 
 Set `compute.device = "cpu"` for CPU. Production calculations use
 `float64/complex128` on both devices. `lattice.L = 0` enables the pilot that
@@ -103,6 +107,10 @@ experiment directory. Existing incomplete runs resume from their frozen child
 config and checkpoint with their original count; newly created runs use the
 new count. Never edit a `mul_*` child config to change an existing run's chain
 count.
+
+`sampling.convergence_batch_total_samples` may also be changed in the
+experiment-level `config.toml`. Completed `mul` runs remain untouched, while
+incomplete and newly created runs use the new convergence-check batch size.
 
 ## Run phases
 
