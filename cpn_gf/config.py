@@ -118,6 +118,9 @@ def run_family_fingerprint(cfg):
     # This only controls how often accumulated production observations are
     # checked for convergence. It does not alter the chain or saved data.
     clean["sampling"].pop("convergence_batch_total_samples", None)
+    # This is an online stopping rule. Existing observations and checkpoints
+    # remain valid when the experiment-level target changes.
+    clean["sampling"].pop("relative_error", None)
     payload = json.dumps(clean, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(payload.encode()).hexdigest()
 

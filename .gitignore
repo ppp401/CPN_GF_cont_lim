@@ -1,5 +1,9 @@
-# legacy files
-legacy/
+# legacy data files
+legacy/__pycache__/
+legacy/.vscode/
+legacy/gf_data/
+legacy/gf_plots/
+legacy/gf_results/
 
 # OS generated files
 .DS_Store

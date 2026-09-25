@@ -174,22 +174,31 @@ def _restore(cfg, run_dir):
     if manifest["schema_version"] != SCHEMA:
         raise ValueError(f"run schema {manifest['schema_version']} cannot be resumed by schema {SCHEMA}; "
                          "completed older runs remain analyzable")
+    previous_sampling = manifest.get("sampling", {})
+    previous_relative_error = previous_sampling.get("relative_error")
     if manifest["config_fingerprint"] != fingerprint(cfg):
-        # Preserve the old on-disk fingerprint while permitting this purely
-        # scheduling-related convergence setting to change.
-        prior_batch = manifest.get("sampling", {}).get(
-            "convergence_batch_total_samples")
+        # Preserve the old on-disk fingerprint while permitting purely
+        # stopping/scheduling-related convergence settings to change.
+        prior_batch = previous_sampling.get("convergence_batch_total_samples")
         compatible_cfg = deepcopy(cfg)
         if prior_batch is not None:
             compatible_cfg["sampling"]["convergence_batch_total_samples"] = prior_batch
-        if prior_batch is None or manifest["config_fingerprint"] != fingerprint(compatible_cfg):
+        if previous_relative_error is not None:
+            compatible_cfg["sampling"]["relative_error"] = previous_relative_error
+        if ((prior_batch is None and previous_relative_error is None)
+                or manifest["config_fingerprint"] != fingerprint(compatible_cfg)):
             raise ValueError("configuration does not match this run")
     # Analysis settings are checkpoint-safe, but changing the online error
     # selection invalidates a convergence streak accumulated under the old rule.
     previous_minimum = manifest.get("analysis", {}).get("min_t_over_a2_for_fit")
     current_minimum = float(cfg["analysis"]["min_t_over_a2_for_fit"])
+    current_relative_error = float(cfg["sampling"]["relative_error"])
     threshold_changed = (previous_minimum is None
-                         or float(previous_minimum) != current_minimum)
+                         or float(previous_minimum) != current_minimum
+                         or previous_relative_error is None
+                         or float(previous_relative_error) != current_relative_error)
+    stricter_relative_error = (previous_relative_error is not None
+                               and current_relative_error < float(previous_relative_error))
     manifest["analysis"] = cfg["analysis"]
     manifest["sampling"] = cfg["sampling"]
     manifest["config_fingerprint"] = fingerprint(cfg)
@@ -212,8 +221,10 @@ def _restore(cfg, run_dir):
     if checkpoint["phase"] == "scale_setting":
         return _finish_scale(cfg, run_dir, engine, manifest)
     if checkpoint["phase"] == "complete":
-        raise RuntimeError("this run is already complete")
-    if checkpoint["phase"] != "production":
+        if not stricter_relative_error:
+            raise RuntimeError("this run is already complete")
+        manifest["phase"] = "production"
+    elif checkpoint["phase"] != "production":
         raise RuntimeError(f"unsupported checkpoint phase: {checkpoint['phase']}")
     streak = 0 if threshold_changed else int(checkpoint.get("convergence_streak", 0))
     atomic_json(run_dir / "manifest.json", manifest)
@@ -425,7 +436,7 @@ def pilot_experiment(experiment_dir):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
                     "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
-                    "or analysis")
+                    "sampling.relative_error, or analysis")
         if manifest_path.is_file():
             with manifest_path.open(encoding="utf-8") as fh:
                 manifest = json.load(fh)
@@ -502,7 +513,7 @@ def resume_experiment(experiment_dir):
     experiment_dir = Path(experiment_dir)
     root_cfg = load_config(experiment_dir / "config.toml")
     outputs = []
-    pending, missing, complete = [], [], []
+    pending, missing, complete, preflight_errors = [], [], [], []
 
     # Preflight every requested existing run before performing expensive work.
     for mul in root_cfg["model"]["mul"]:
@@ -523,16 +534,50 @@ def resume_experiment(experiment_dir):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
                     "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
-                    "or analysis")
+                    "sampling.relative_error, or analysis")
+            previous_relative_error = float(
+                manifest.get("sampling", {}).get(
+                    "relative_error", child_cfg["sampling"]["relative_error"]))
+            current_relative_error = float(root_cfg["sampling"]["relative_error"])
             child_cfg["analysis"] = dict(root_cfg["analysis"])
             child_cfg["sampling"]["convergence_batch_total_samples"] = int(
                 root_cfg["sampling"]["convergence_batch_total_samples"])
+            child_cfg["sampling"]["relative_error"] = current_relative_error
             if manifest.get("phase") == "complete":
-                complete.append((mul, manifest))
+                if current_relative_error < previous_relative_error:
+                    checkpoint_path = run_dir / "checkpoint.pt"
+                    if not checkpoint_path.is_file():
+                        preflight_errors.append(
+                            f"{run_dir}: stricter relative_error requires the final checkpoint")
+                    else:
+                        try:
+                            checkpoint = load_checkpoint(checkpoint_path)
+                        except Exception as exc:
+                            preflight_errors.append(
+                                f"{run_dir}: final checkpoint cannot be loaded ({exc})")
+                        else:
+                            chains = int(manifest.get("chains", child_cfg["hmc"]["chains"]))
+                            maximum = math.ceil(
+                                int(child_cfg["sampling"]["flow_max_total_samples"]) / chains)
+                            samples = int(checkpoint.get(
+                                "samples", manifest.get("completed_samples_per_chain", 0)))
+                            if checkpoint.get("phase") != "complete":
+                                preflight_errors.append(
+                                    f"{run_dir}: final checkpoint is not in the complete phase")
+                            elif samples >= maximum:
+                                preflight_errors.append(
+                                    f"{run_dir}: flow_max_total_samples has already been reached")
+                    pending.append((mul, run_dir, manifest_path, manifest, child_cfg))
+                else:
+                    complete.append((mul, manifest))
             else:
                 pending.append((mul, run_dir, manifest_path, manifest, child_cfg))
         else:
             missing.append((mul, run_dir))
+
+    if preflight_errors:
+        details = "\n".join(f"- {message}" for message in preflight_errors)
+        raise RuntimeError(f"cannot resume completed runs under stricter relative_error:\n{details}")
 
     for mul, run_dir, manifest_path, manifest, cfg in pending:
         try:
@@ -555,9 +600,11 @@ def resume_experiment(experiment_dir):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
                     "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
-                    "or analysis")
+                    "sampling.relative_error, or analysis")
             cfg["sampling"]["convergence_batch_total_samples"] = int(
                 root_cfg["sampling"]["convergence_batch_total_samples"])
+            cfg["sampling"]["relative_error"] = float(
+                root_cfg["sampling"]["relative_error"])
             model = scaled_model(cfg, mul)
         else:
             shutil.copy2(experiment_dir / "config.toml", config_copy)

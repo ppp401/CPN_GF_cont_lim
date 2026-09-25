@@ -39,12 +39,37 @@ def jackknife_error(replicas):
 
 
 def _interp(values, times, targets):
-    # values: sample,time,observable; result sample,target,observable
+    """Interpolate every sample/observable on one shared time grid."""
+    values = np.asarray(values)
+    times = np.asarray(times)
+    targets = np.asarray(targets)
     out = np.empty((values.shape[0], len(targets), values.shape[2]), dtype=float)
-    for sample in range(values.shape[0]):
-        for obs in range(values.shape[2]):
-            out[sample, :, obs] = np.interp(targets, times, values[sample, :, obs])
+    if len(times) == 1:
+        out[...] = values[:, :1, :]
+        return out
+
+    upper = np.searchsorted(times, targets, side="right")
+    below = upper == 0
+    above = upper == len(times)
+    middle = ~(below | above)
+    if np.any(below):
+        out[:, below, :] = values[:, :1, :]
+    if np.any(above):
+        out[:, above, :] = values[:, -1:, :]
+    if np.any(middle):
+        hi = upper[middle]
+        lo = hi - 1
+        weight = ((targets[middle] - times[lo]) / (times[hi] - times[lo]))
+        out[:, middle, :] = (values[:, lo, :] * (1.0 - weight[None, :, None])
+                             + values[:, hi, :] * weight[None, :, None])
     return out
+
+
+def _progress(iterable, enabled, desc, total=None):
+    if not enabled:
+        return iterable
+    from tqdm import tqdm
+    return tqdm(iterable, total=total, desc=desc, leave=False)
 
 
 def _observables(values, L):
@@ -61,12 +86,16 @@ def _observables(values, L):
     return np.stack((E, S00, xi, qz_mean, chit_z, qu_mean, chit_u), axis=-1)
 
 
-def analyze_flow(chain_values, times, rho, xi, xi_loo, L):
+def analyze_flow(chain_values, times, rho, xi, xi_loo, L, progress=False,
+                 progress_prefix=""):
     target = np.asarray(rho) * xi * xi
     selected = np.concatenate([_interp(c, times, target) for c in chain_values], axis=0)
     central = _observables(selected, L)
     replicas = []
-    for omitted in range(len(chain_values)):
+    omitted_chains = _progress(range(len(chain_values)), progress,
+                               f"{progress_prefix}flow jackknife",
+                               total=len(chain_values))
+    for omitted in omitted_chains:
         jt = np.asarray(rho) * xi_loo[omitted] ** 2
         sample = np.concatenate([_interp(c, times, jt) for i, c in enumerate(chain_values)
                                  if i != omitted], axis=0)
@@ -75,12 +104,16 @@ def analyze_flow(chain_values, times, rho, xi, xi_loo, L):
     return central, errors, target
 
 
-def analyze_unflowed(chain_values, chain_qs, L):
+def analyze_unflowed(chain_values, chain_qs, L, progress=False,
+                     progress_prefix=""):
     """Analyze the t=0 row of production configurations with chain jackknife."""
     selected = np.concatenate([c[:, 0, :] for c in chain_values], axis=0)[:, None, :]
     central = _observables(selected, L)[0]
     replicas = []
-    for omitted in range(len(chain_values)):
+    omitted_chains = _progress(range(len(chain_values)), progress,
+                               f"{progress_prefix}unflowed jackknife",
+                               total=len(chain_values))
+    for omitted in omitted_chains:
         sample = np.concatenate([c[:, 0, :] for i, c in enumerate(chain_values)
                                  if i != omitted], axis=0)[:, None, :]
         replicas.append(_observables(sample, L)[0])
@@ -91,7 +124,10 @@ def analyze_unflowed(chain_values, chain_qs, L):
         mean = float(flat.mean())
         chi = float(np.mean((flat - mean) ** 2) / (L * L))
         qrep, chirep = [], []
-        for omitted in range(len(chain_qs)):
+        omitted_chains = _progress(range(len(chain_qs)), progress,
+                                   f"{progress_prefix}Q_s jackknife",
+                                   total=len(chain_qs))
+        for omitted in omitted_chains:
             sample = np.concatenate([q for i, q in enumerate(chain_qs) if i != omitted])
             sample_mean = float(sample.mean())
             qrep.append(sample_mean)

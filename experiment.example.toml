@@ -68,6 +68,8 @@ flow_max_total_samples = 100000
 # [改为总量] 每新增约多少个 flow 构型检查一次误差；同样向上取整到链数整数倍。
 convergence_batch_total_samples = 2000
 # [新增] 全部 rho 上 t*E_action 必须低于的 jackknife 相对误差。
+# 可在实验根 config.toml 中修改后 resume：未完成/新 run 使用新值；已完成 run
+# 在放宽时原样复用，在收紧时需有最终 checkpoint 和剩余最大样本预算才能继续采样。
 relative_error = 0.05
 # [新增] 连续多少次误差检查合格才停止，避免一次偶然偏小的误差导致早停。
 consecutive_checks = 2

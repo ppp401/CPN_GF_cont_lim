@@ -5,12 +5,19 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import load_config
+from .config import load_config, mul_directory_name
 from .io import atomic_json, atomic_npz
 from .stats import analyze_flow, analyze_unflowed
 
 
-def load_chain_values(run_dir, chains):
+def _progress(iterable, enabled, desc, total=None):
+    if not enabled:
+        return iterable
+    from tqdm import tqdm
+    return tqdm(iterable, total=total, desc=desc, leave=False)
+
+
+def load_chain_values(run_dir, chains, progress=False, progress_prefix=""):
     run_dir = Path(run_dir)
     parts = sorted((run_dir / "observations").glob("flow_*.npz"))
     if not parts:
@@ -19,7 +26,9 @@ def load_chain_values(run_dir, chains):
     per_chain_qs = [[] for _ in range(chains)]
     has_qs = None
     output_steps = times = None
-    for path in parts:
+    paths = _progress(parts, progress, f"{progress_prefix}load flow chunks",
+                      total=len(parts))
+    for path in paths:
         with np.load(path, allow_pickle=False) as data:
             if "values" in data.files:
                 values = data["values"]
@@ -70,7 +79,7 @@ def _relative_error_summary(relative_errors, target_times, threshold, minimum_fl
             "converged": bool(np.all(selected <= float(threshold)))}
 
 
-def analyze_run(run_dir, write=True, minimum_flow_time=None):
+def analyze_run(run_dir, write=True, minimum_flow_time=None, progress=False):
     run_dir = Path(run_dir)
     with (run_dir / "manifest.json").open(encoding="utf-8") as fh:
         manifest = json.load(fh)
@@ -78,9 +87,14 @@ def analyze_run(run_dir, write=True, minimum_flow_time=None):
         xi, xi_loo = float(scale["xi"]), scale["xi_loo"].copy()
     rho, L = np.asarray(manifest["flow"]["rho"], dtype=float), int(manifest["L"])
     chains = int(manifest["chains"])
-    chain_values, chain_qs, times, output_steps, parts = load_chain_values(run_dir, chains)
-    values, errors, target_times = analyze_flow(chain_values, times, rho, xi, xi_loo, L)
-    unflowed, unflowed_errors, qs = analyze_unflowed(chain_values, chain_qs, L)
+    prefix = f"{run_dir.name}: "
+    chain_values, chain_qs, times, output_steps, parts = load_chain_values(
+        run_dir, chains, progress=progress, progress_prefix=prefix)
+    values, errors, target_times = analyze_flow(
+        chain_values, times, rho, xi, xi_loo, L, progress=progress,
+        progress_prefix=prefix)
+    unflowed, unflowed_errors, qs = analyze_unflowed(
+        chain_values, chain_qs, L, progress=progress, progress_prefix=prefix)
     names = ("E_action", "chi_m", "xi", "Q_z_mean", "chi_t_Q_z", "Q_U_mean", "chi_t_Q_U")
     result = {"rho": rho, "target_times": target_times, "times": times,
               "output_steps": output_steps,
@@ -147,17 +161,24 @@ def _plot_run(run_dir, result):
     plt.close(fig)
 
 
-def analyze_path(path):
+def analyze_path(path, progress=False, aggregate_only=False):
     """Analyze one mul run or every mul run in an experiment directory."""
     path = Path(path)
     if (path / "manifest.json").is_file():
+        if aggregate_only:
+            raise ValueError("aggregate-only analysis requires an experiment directory")
         with (path / "manifest.json").open(encoding="utf-8") as fh:
             phase = json.load(fh).get("phase")
         if phase in ("pilot_complete", "pilot_error"):
             raise RuntimeError("pilot-only runs have no production observations to analyze")
-        return {path.name: analyze_run(path, write=True)[1]}
+        return {path.name: analyze_run(path, write=True, progress=progress)[1]}
+    root_config = path / "config.toml"
+    if not root_config.is_file():
+        raise RuntimeError(f"experiment analysis requires {root_config}")
+    cfg = load_config(root_config)
     runs = []
-    for run in sorted(path.glob("mul_*")):
+    for mul in cfg["model"]["mul"]:
+        run = path / mul_directory_name(mul)
         manifest_path = run / "manifest.json"
         if not manifest_path.is_file():
             continue
@@ -167,19 +188,31 @@ def analyze_path(path):
             runs.append(run)
     if not runs:
         raise RuntimeError(f"no production runs found below {path}")
-    minimum_flow_time = (float(load_config(path / "config.toml")["analysis"]
-                               ["min_t_over_a2_for_fit"])
-                         if (path / "config.toml").is_file() else None)
-    summaries = {run.name: analyze_run(run, write=True,
-                                      minimum_flow_time=minimum_flow_time)[1]
-                 for run in runs}
-    _continuum_analysis(path, runs, summaries)
+    minimum_flow_time = float(cfg["analysis"]["min_t_over_a2_for_fit"])
+    summaries = {}
+    if aggregate_only:
+        missing = [run for run in runs if not (run / "results.json").is_file()
+                   or not (run / "results.npz").is_file()]
+        if missing:
+            names = ", ".join(run.name for run in missing)
+            raise RuntimeError(f"aggregate-only analysis requires existing results for: {names}")
+        run_iterator = _progress(runs, progress, "load mul results", total=len(runs))
+        for run in run_iterator:
+            with (run / "results.json").open(encoding="utf-8") as fh:
+                summaries[run.name] = json.load(fh)
+    else:
+        run_iterator = _progress(runs, progress, "analyze mul runs", total=len(runs))
+        for run in run_iterator:
+            summaries[run.name] = analyze_run(
+                run, write=True, minimum_flow_time=minimum_flow_time,
+                progress=progress)[1]
+    _continuum_analysis(path, runs, summaries, progress=progress)
     atomic_json(path / "analysis.json", summaries)
     return summaries
 
 
-def _continuum_analysis(root, runs, summaries):
-    """Linear 1/xi^2 extrapolation of tE at fixed rho across mul runs."""
+def _continuum_analysis(root, runs, summaries, progress=False):
+    """Quadratic 1/xi^2 extrapolation of tE at fixed rho across mul runs."""
     from scipy import odr
     import matplotlib
     matplotlib.use("Agg")
@@ -204,7 +237,9 @@ def _continuum_analysis(root, runs, summaries):
                                .get("analysis", {}).get("min_t_over_a2_for_fit", 1.0)))
     out, plot_dir = {}, Path(root) / "plots" / "continuum"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    for index, rho in enumerate(reference):
+    rho_iterator = _progress(enumerate(reference), progress, "continuum fits",
+                             total=len(reference))
+    for index, rho in rho_iterator:
         xi = np.asarray([item[1]["xi_scale"] for item in entries])
         xi_err = np.asarray([item[1]["xi_scale_error"] for item in entries])
         y = np.asarray([item[2]["tE_action"][index] for item in entries])
@@ -215,14 +250,18 @@ def _continuum_analysis(root, runs, summaries):
                   & np.isfinite(yerr) & (xerr > 0) & (yerr > 0))
         mask = finite & (target >= minimum_flow_time)
         fit = None
-        if mask.sum() >= 3:
-            model = odr.Model(lambda p, xx: p[0] * xx + p[1])
-            seed = np.polyfit(x[mask], y[mask], 1)
+        if mask.sum() >= 4:
+            model = odr.Model(lambda p, xx: p[0] * xx ** 2 + p[1] * xx + p[2])
+            seed = np.polyfit(x[mask], y[mask], 2)
             result = odr.ODR(odr.RealData(x[mask], y[mask], sx=xerr[mask], sy=yerr[mask]),
                              model, beta0=seed).run()
-            fit = {"slope": float(result.beta[0]), "continuum": float(result.beta[1]),
-                   "slope_error": float(result.sd_beta[0]),
-                   "continuum_error": float(result.sd_beta[1])}
+            fit = {"model": "quadratic_in_inverse_xi2",
+                   "quadratic": float(result.beta[0]),
+                   "slope": float(result.beta[1]),
+                   "continuum": float(result.beta[2]),
+                   "quadratic_error": float(result.sd_beta[0]),
+                   "slope_error": float(result.sd_beta[1]),
+                   "continuum_error": float(result.sd_beta[2])}
         out[f"rho_{rho:.6f}"] = {"rho": float(rho), "n_points": int(mask.sum()),
                                   "min_t_over_a2_for_fit": minimum_flow_time,
                                   "fit": fit, "inverse_xi2": x,
@@ -239,13 +278,38 @@ def _continuum_analysis(root, runs, summaries):
                         fmt="o", capsize=3, label="fit data")
         if fit is not None:
             xx = np.linspace(0, 1.05 * np.nanmax(x), 200)
-            ax.plot(xx, fit["slope"] * xx + fit["continuum"])
+            ax.plot(xx, (fit["quadratic"] * xx ** 2 + fit["slope"] * xx
+                         + fit["continuum"]), label="quadratic fit")
         ax.set(xlabel=r"$1/\xi^2$", ylabel=r"$t\langle E(t)\rangle$",
                title=rf"$\rho={rho:.3f}$")
         ax.grid(alpha=0.25)
         if excluded.any():
             ax.legend()
+        elif fit is not None:
+            ax.legend()
         fig.tight_layout()
         fig.savefig(plot_dir / f"tE_rho_{rho:.3f}.png", dpi=180)
         plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.8))
+    for mul, _, data in entries:
+        ax.errorbar(data["rho"], data["tE_action"], yerr=data["tE_action_error"],
+                    marker="o", capsize=3, label=rf"mul={mul:g}")
+    continuum_rho = np.asarray([item["rho"] for item in out.values()
+                                if item["fit"] is not None])
+    continuum = np.asarray([item["fit"]["continuum"] for item in out.values()
+                            if item["fit"] is not None])
+    continuum_error = np.asarray([
+        item["fit"]["continuum_error"] for item in out.values()
+        if item["fit"] is not None])
+    if len(continuum_rho):
+        ax.errorbar(continuum_rho, continuum, yerr=continuum_error,
+                    color="black", linestyle="--", marker="*", markersize=9,
+                    linewidth=1.5, capsize=3, label="continuum")
+    ax.set(xlabel=r"$\rho=t/\xi^2$", ylabel=r"$t\langle E(t)\rangle$")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(Path(root) / "plots" / "tE_action_vs_rho_by_mul.png", dpi=180)
+    plt.close(fig)
     atomic_json(Path(root) / "continuum_fits.json", out)

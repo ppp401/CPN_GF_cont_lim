@@ -1,10 +1,43 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 from .analysis import analyze_path
 from .recommend import print_recommendation, recommend_chains
 from .runner import pilot_config, pilot_experiment, resume_run, run_config
+
+
+def _print_analysis_summary(path, summaries, aggregate_only=False):
+    path = Path(path)
+    print(f"Analysis complete: {path}")
+    if (path / "manifest.json").is_file():
+        summary = next(iter(summaries.values()))
+        xi = summary.get("xi_scale")
+        xi_error = summary.get("xi_scale_error")
+        if xi is not None and xi_error is not None:
+            print(f"xi_scale: {float(xi):.8g} +/- {float(xi_error):.3g}")
+        samples = summary.get("n_samples_per_chain")
+        if samples is not None and len(samples):
+            low, high = int(min(samples)), int(max(samples))
+            value = str(low) if low == high else f"{low}-{high}"
+            print(f"samples per chain: {value}")
+        if "converged" in summary:
+            print(f"converged: {bool(summary['converged'])}")
+        print(f"outputs: {path / 'results.json'}, {path / 'results.npz'}, {path / 'plots'}")
+        return
+
+    mode = "aggregate only" if aggregate_only else "per-mul and aggregate"
+    print(f"mode: {mode}")
+    print("mul runs: " + ", ".join(summaries))
+    fits_path = path / "continuum_fits.json"
+    if fits_path.is_file():
+        with fits_path.open(encoding="utf-8") as fh:
+            fits = json.load(fh)
+        fitted = sum(item.get("fit") is not None for item in fits.values())
+        print(f"continuum fits: {fitted}/{len(fits)} rho values")
+    print(f"outputs: {path / 'analysis.json'}, {fits_path}, {path / 'plots'}")
 
 
 def main(argv=None):
@@ -20,6 +53,8 @@ def main(argv=None):
     resume.add_argument("--run", required=True)
     analyze = sub.add_parser("analyze", help="rebuild aggregate results")
     analyze.add_argument("--run", required=True)
+    analyze.add_argument("--aggregate-only", action="store_true",
+                         help="reuse per-mul results and rebuild only experiment summaries")
     recommend = sub.add_parser("recommend-chains", help="benchmark and recommend HMC chains")
     recommend.add_argument("--config", required=True)
     size = recommend.add_mutually_exclusive_group()
@@ -49,7 +84,10 @@ def main(argv=None):
         else:
             print(result["status"])
     elif args.command == "analyze":
-        print(analyze_path(args.run))
+        summaries = analyze_path(args.run, progress=True,
+                                 aggregate_only=args.aggregate_only)
+        _print_analysis_summary(args.run, summaries,
+                                aggregate_only=args.aggregate_only)
     else:
         print_recommendation(recommend_chains(
             args.config, lattice_size=args.lattice_size,

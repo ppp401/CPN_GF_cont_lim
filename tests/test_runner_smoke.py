@@ -191,6 +191,19 @@ root = "{output}"
             self.assertEqual(run_family_fingerprint(load_config(first)),
                              run_family_fingerprint(load_config(second)))
 
+    def test_run_family_allows_relative_error_difference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "first.toml", root / "second.toml"
+            self._write_config(first, "[0.8]", root / "runs")
+            self._write_config(second, "[0.8]", root / "runs")
+            with first.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.05\n")
+            with second.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.02\n")
+            self.assertEqual(run_family_fingerprint(load_config(first)),
+                             run_family_fingerprint(load_config(second)))
+
     def test_experiment_resume_uses_new_convergence_batch_for_unfinished_run(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -200,9 +213,11 @@ root = "{output}"
             self._write_config(root_config, "[0.8, 0.9]", root / "runs")
             self._write_config(child_config, "[0.8, 0.9]", root / "runs")
             with root_config.open("a", encoding="utf-8") as fh:
-                fh.write("\n[sampling]\nconvergence_batch_total_samples = 12800\n")
+                fh.write("\n[sampling]\nconvergence_batch_total_samples = 12800\n"
+                         "relative_error = 0.05\n")
             with child_config.open("a", encoding="utf-8") as fh:
-                fh.write("\n[sampling]\nconvergence_batch_total_samples = 6400\n")
+                fh.write("\n[sampling]\nconvergence_batch_total_samples = 6400\n"
+                         "relative_error = 0.02\n")
             for mul, phase in ((0.8, "production"), (0.9, "complete")):
                 run_dir = experiment / f"mul_{mul:g}"
                 run_dir.mkdir()
@@ -215,14 +230,15 @@ root = "{output}"
 
             def restore(cfg, run_dir):
                 seen.append((run_dir.name,
-                             cfg["sampling"]["convergence_batch_total_samples"]))
+                             cfg["sampling"]["convergence_batch_total_samples"],
+                             cfg["sampling"]["relative_error"]))
                 return object(), {"model": {"mul": 0.8}}, 0, 0, 0
 
             with patch("cpn_gf.runner._restore", side_effect=restore), \
                     patch("cpn_gf.runner._production", return_value={"status": "ok"}):
                 result = resume_run(experiment)
 
-            self.assertEqual(seen, [("mul_0.8", 12800)])
+            self.assertEqual(seen, [("mul_0.8", 12800, 0.05)])
             self.assertEqual([(item["mul"], item["action"]) for item in result["runs"]],
                              [(0.8, "resumed"), (0.9, "skipped")])
 
@@ -259,12 +275,205 @@ root = "{output}"
             self.assertEqual(restored["sampling"]["convergence_batch_total_samples"], 12800)
             self.assertEqual(restored["config_fingerprint"], fingerprint(new_cfg))
 
+    def test_restore_reopens_complete_checkpoint_for_stricter_relative_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_config, new_config = root / "old.toml", root / "new.toml"
+            self._write_config(old_config, "[0.8]", root / "runs")
+            self._write_config(new_config, "[0.8]", root / "runs")
+            with old_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.05\n")
+            with new_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.02\n")
+            old_cfg, new_cfg = load_config(old_config), load_config(new_config)
+            run_dir = root / "mul_0.8"
+            run_dir.mkdir()
+            manifest = {"schema_version": 1, "config_fingerprint": fingerprint(old_cfg),
+                        "phase": "complete", "status": "ok",
+                        "model": {"mul": 0.8}, "L": 8, "chains": 4,
+                        "sampling": old_cfg["sampling"], "analysis": old_cfg["analysis"]}
+            (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            class Engine:
+                def load_state_dict(self, state):
+                    self.state = state
+
+            checkpoint = {"phase": "complete", "engine": {"state": 1},
+                          "samples": 10, "chunks": 2, "convergence_streak": 3}
+            with patch("cpn_gf.runner._new_engine", return_value=Engine()), \
+                    patch("cpn_gf.runner.load_checkpoint", return_value=checkpoint):
+                _, restored, samples, chunks, streak = _restore(new_cfg, run_dir)
+
+            self.assertEqual((samples, chunks, streak), (10, 2, 0))
+            self.assertEqual(restored["phase"], "production")
+            self.assertEqual(restored["sampling"]["relative_error"], 0.02)
+
+    def test_relaxed_relative_error_leaves_completed_run_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            experiment.mkdir()
+            root_config, child_config = experiment / "config.toml", root / "child.toml"
+            self._write_config(root_config, "[0.8]", root / "runs")
+            self._write_config(child_config, "[0.8]", root / "runs")
+            with root_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.05\n")
+            with child_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.02\n")
+            run_dir = experiment / "mul_0.8"
+            run_dir.mkdir()
+            shutil.copy2(child_config, run_dir / "config.toml")
+            manifest = {"phase": "complete", "status": "complete_with_warning",
+                        "model": {"mul": 0.8},
+                        "sampling": {"relative_error": 0.02}}
+            manifest_path = run_dir / "manifest.json"
+            original = json.dumps(manifest)
+            manifest_path.write_text(original, encoding="utf-8")
+
+            with patch("cpn_gf.runner._restore") as restore:
+                result = resume_run(experiment)
+
+            restore.assert_not_called()
+            self.assertEqual(result["runs"][0]["action"], "skipped")
+            self.assertEqual(manifest_path.read_text(encoding="utf-8"), original)
+
+    def test_stricter_relative_error_resumes_completed_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            experiment.mkdir()
+            root_config, child_config = experiment / "config.toml", root / "child.toml"
+            self._write_config(root_config, "[0.8]", root / "runs")
+            self._write_config(child_config, "[0.8]", root / "runs")
+            with root_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.02\n")
+            with child_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.05\n")
+            run_dir = experiment / "mul_0.8"
+            run_dir.mkdir()
+            shutil.copy2(child_config, run_dir / "config.toml")
+            (run_dir / "manifest.json").write_text(json.dumps({
+                "phase": "complete", "status": "ok", "model": {"mul": 0.8},
+                "chains": 64, "sampling": {"relative_error": 0.05}}), encoding="utf-8")
+            (run_dir / "checkpoint.pt").touch()
+            checkpoint = {"phase": "complete", "samples": 10}
+            seen = []
+
+            def restore(cfg, path):
+                seen.append(cfg["sampling"]["relative_error"])
+                return object(), {"model": {"mul": 0.8}}, 10, 1, 0
+
+            with patch("cpn_gf.runner.load_checkpoint", return_value=checkpoint), \
+                    patch("cpn_gf.runner._restore", side_effect=restore), \
+                    patch("cpn_gf.runner._production", return_value={"status": "ok"}):
+                result = resume_run(experiment)
+
+            self.assertEqual(seen, [0.02])
+            self.assertEqual(result["runs"][0]["action"], "resumed")
+
+    def test_stricter_relative_error_preflight_rejects_all_unresumable_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            experiment.mkdir()
+            root_config, child_config = experiment / "config.toml", root / "child.toml"
+            self._write_config(root_config, "[0.8, 0.9, 1.0]", root / "runs")
+            self._write_config(child_config, "[0.8, 0.9]", root / "runs")
+            with root_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.02\n")
+            with child_config.open("a", encoding="utf-8") as fh:
+                fh.write("\n[sampling]\nrelative_error = 0.05\n")
+            for mul in (0.8, 0.9):
+                run_dir = experiment / f"mul_{mul:g}"
+                run_dir.mkdir()
+                shutil.copy2(child_config, run_dir / "config.toml")
+                (run_dir / "manifest.json").write_text(json.dumps({
+                    "phase": "complete", "status": "ok", "model": {"mul": mul},
+                    "chains": 64, "sampling": {"relative_error": 0.05}}), encoding="utf-8")
+            (experiment / "mul_0.9" / "checkpoint.pt").touch()
+
+            with patch("cpn_gf.runner.load_checkpoint", return_value={
+                    "phase": "complete", "samples": 1563}), \
+                    patch("cpn_gf.runner._restore") as restore, \
+                    patch("cpn_gf.runner._prepare_new") as prepare:
+                with self.assertRaisesRegex(
+                        RuntimeError, "(?s)final checkpoint.*flow_max_total_samples"):
+                    resume_run(experiment)
+
+            restore.assert_not_called()
+            prepare.assert_not_called()
+            self.assertFalse((experiment / "mul_1").exists())
+
     def test_mul_directory_collisions_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "collision.toml"
             self._write_config(path, "[1.0000001, 1.0000002]", Path(directory) / "runs")
             with self.assertRaisesRegex(ValueError, "distinct mul_\\* directory names"):
                 load_config(path)
+
+    def test_analysis_uses_only_muls_listed_in_root_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "experiment"
+            root.mkdir()
+            self._write_config(root / "config.toml", "[0.8, 0.9]", root)
+            for mul in (0.8, 0.9, 1.0):
+                run = root / f"mul_{mul:g}"
+                run.mkdir()
+                (run / "manifest.json").write_text(json.dumps({
+                    "phase": "complete", "status": "ok",
+                    "model": {"mul": mul}}), encoding="utf-8")
+
+            def fake_analyze(run, **kwargs):
+                return {}, {"run": Path(run).name}
+
+            with patch("cpn_gf.analysis.analyze_run", side_effect=fake_analyze) as analyze, \
+                    patch("cpn_gf.analysis._continuum_analysis") as continuum:
+                result = analyze_path(root)
+
+            self.assertEqual(list(result), ["mul_0.8", "mul_0.9"])
+            self.assertEqual([call.args[0].name for call in analyze.call_args_list],
+                             ["mul_0.8", "mul_0.9"])
+            continuum.assert_called_once()
+
+    def test_aggregate_only_reuses_existing_mul_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "experiment"
+            root.mkdir()
+            self._write_config(root / "config.toml", "[0.8, 0.9]", root)
+            for mul in (0.8, 0.9):
+                run = root / f"mul_{mul:g}"
+                run.mkdir()
+                (run / "manifest.json").write_text(json.dumps({
+                    "phase": "complete", "status": "ok",
+                    "model": {"mul": mul}}), encoding="utf-8")
+                (run / "results.json").write_text(json.dumps({
+                    "xi_scale": mul, "xi_scale_error": 0.1}), encoding="utf-8")
+                np.savez(run / "results.npz", rho=np.asarray([0.1]),
+                         target_times=np.asarray([1.0]),
+                         tE_action=np.asarray([0.2]),
+                         tE_action_error=np.asarray([0.01]))
+
+            with patch("cpn_gf.analysis.analyze_run") as analyze, \
+                    patch("cpn_gf.analysis._continuum_analysis") as continuum:
+                result = analyze_path(root, aggregate_only=True)
+
+            analyze.assert_not_called()
+            self.assertEqual(list(result), ["mul_0.8", "mul_0.9"])
+            continuum.assert_called_once()
+
+    def test_aggregate_only_requires_existing_mul_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "experiment"
+            root.mkdir()
+            self._write_config(root / "config.toml", "[0.8]", root)
+            run = root / "mul_0.8"
+            run.mkdir()
+            (run / "manifest.json").write_text(json.dumps({
+                "phase": "complete", "status": "ok", "model": {"mul": 0.8}}),
+                encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "existing results.*mul_0.8"):
+                analyze_path(root, aggregate_only=True)
 
     def test_experiment_resume_rejects_non_mul_config_changes_before_work(self):
         with tempfile.TemporaryDirectory() as directory:

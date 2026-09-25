@@ -58,14 +58,47 @@ To add parameter points to an existing experiment, edit only the experiment-leve
 `resume` command. Existing interrupted runs are resumed first, newly added values
 are run afterward, and completed values are skipped. Each `mul_*` directory keeps
 an automatically managed frozen config for exact restart and provenance; do not
-edit those copies. Settings other than `model.mul` and `[analysis]` must remain
-unchanged within one experiment directory.
+edit those copies. Settings other than `model.mul`, `[analysis]`, and the
+documented resumable sampling settings below must remain unchanged within one
+experiment directory.
 
 Rebuild results and plots for one `mul` or a whole experiment with:
 
 ```powershell
 python -m cpn_gf analyze --run runs/<experiment>
 ```
+
+Experiment-level analysis considers only the `model.mul` values listed in the
+experiment root `config.toml`; extra `mul_*` directories are ignored. The
+command displays progress while loading flow chunks, computing the per-chain
+jackknife estimates, and building the continuum fits.
+
+Each completed production run already writes its own `results.json` and
+`results.npz`. To reuse those files and rebuild only the experiment-level
+summaries and plots, run:
+
+```powershell
+python -m cpn_gf analyze --run runs/<experiment> --aggregate-only
+```
+
+This mode does not read the flow chunks, repeat the per-`mul` jackknife
+analysis, or rebuild the individual `mul` plots. It requires both result files
+for every configured production run and reports any that are missing. The CLI
+prints only a compact completion summary and output paths; complete numerical
+results remain in the JSON and NPZ files.
+
+At each fixed `rho=t/xi^2`, continuum extrapolation uses an error-in-both-axes
+quadratic fit
+
+```text
+t<E(t)> = c0 + c1/xi^2 + c2/xi^4
+```
+
+with at least four eligible `mul` points; `c0` is the continuum value. The
+numeric fits are written to `continuum_fits.json`, the fixed-`rho` fit plots to
+`plots/continuum/`, and the overlay of all configured `mul` curves to
+`plots/tE_action_vs_rho_by_mul.png`. That overlay also shows the fitted
+continuum values and their errors at every `rho` with enough eligible points.
 
 `analysis.min_t_over_a2_for_fit` controls the minimum lattice flow time used
 by continuum fits and by the online relative-error stopping test. The flow
@@ -111,6 +144,14 @@ count.
 `sampling.convergence_batch_total_samples` may also be changed in the
 experiment-level `config.toml`. Completed `mul` runs remain untouched, while
 incomplete and newly created runs use the new convergence-check batch size.
+
+`sampling.relative_error` may be changed there as well. Incomplete and newly
+created runs use the new target and restart their consecutive-convergence count.
+Completed runs are left untouched when the target is unchanged or relaxed. When
+the target is tightened, a completed run resumes production from its final
+checkpoint and accumulates fresh convergence checks. This requires
+`output.keep_final_checkpoint=true` and unused `flow_max_total_samples` capacity;
+resume reports all runs that fail either requirement before starting any work.
 
 ## Run phases
 
